@@ -113,6 +113,20 @@ def join_words(words: List[Word]) -> str:
     return "".join(w.text for w in words).strip()
 
 
+def fix_first_word(words: List[Word], max_gap: float = 0.6) -> None:
+    """Whisper는 구간의 첫 단어 시작을 앞쪽 무음에 잘못 찍는 경우가 있다.
+    (예: 실제로는 22.4초에 나오는 "한"을 19.6초로) 그러면 첫 단어만 앞 문장 끝에
+    따로 떠 버리므로, 둘째 단어와 너무 떨어져 있으면 둘째 단어 바로 앞으로 옮긴다."""
+    if len(words) < 2:
+        return
+    first, second = words[0], words[1]
+    if second.start - first.end <= max_gap or SENTENCE_END.search(first.text.strip()):
+        return
+    duration = min(first.end - first.start, 0.15 + 0.12 * len(first.text.strip()))
+    first.end = second.start
+    first.start = max(first.end - duration, 0.0)
+
+
 def split_into_phrases(segments: List[List[Word]], max_gap: float = 0.6) -> List[List[Word]]:
     """문장 끝, Whisper 구간 끝, 긴 쉼에서 반드시 끊는다."""
     phrases = []
@@ -241,9 +255,40 @@ def add_nvidia_dll_paths():
                 pass
 
 
+def ensure_model(model_name: str) -> str:
+    """모델을 (처음 한 번만) 내려받고 폴더 경로를 돌려준다. 이미 받았으면 인터넷 없이 바로 사용."""
+    if os.path.isdir(model_name):
+        return model_name
+    import huggingface_hub
+    from faster_whisper.utils import _MODELS
+
+    repo_id = model_name if "/" in model_name else _MODELS.get(model_name)
+    if repo_id is None:
+        raise RuntimeError(f"config.txt 의 model 값이 올바르지 않습니다: {model_name} "
+                           "(large-v3 또는 large-v3-turbo 를 쓰세요)")
+    patterns = ["config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.*"]
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    try:
+        path = huggingface_hub.snapshot_download(repo_id, allow_patterns=patterns,
+                                                 cache_dir=MODELS_DIR, local_files_only=True)
+        if os.path.isfile(os.path.join(path, "model.bin")):
+            return path
+    except Exception:  # noqa: BLE001 - 아직 안 받았으면 아래에서 내려받는다
+        pass
+    print("  처음 한 번 모델을 내려받습니다 (large-v3 는 약 3GB). 끝날 때까지 기다려 주세요...")
+    try:
+        return huggingface_hub.snapshot_download(repo_id, allow_patterns=patterns, cache_dir=MODELS_DIR)
+    except Exception as e:  # noqa: BLE001
+        first_line = (str(e).splitlines() or [type(e).__name__])[0][:200]
+        raise RuntimeError("모델을 내려받지 못했습니다. 인터넷 연결과 디스크 공간(약 3GB)을 확인하고 "
+                           f"다시 실행해 주세요.\n  ({first_line})") from e
+
+
 def load_model(model_name: str, device_pref: str):
     import numpy as np
     from faster_whisper import WhisperModel
+
+    model_path = ensure_model(model_name)  # 다운로드 문제와 GPU 문제를 따로 구분하기 위해 먼저 받는다
 
     attempts = []
     if device_pref in ("auto", "gpu", "cuda"):
@@ -251,13 +296,11 @@ def load_model(model_name: str, device_pref: str):
     if device_pref in ("auto", "cpu"):
         attempts += [("cpu", "int8")]
 
-    os.makedirs(MODELS_DIR, exist_ok=True)
     last_error = None
     for device, compute_type in attempts:
         try:
-            model = WhisperModel(model_name, device=device, compute_type=compute_type,
-                                 cpu_threads=(os.cpu_count() or 4) if device == "cpu" else 0,
-                                 download_root=MODELS_DIR)
+            model = WhisperModel(model_path, device=device, compute_type=compute_type,
+                                 cpu_threads=(os.cpu_count() or 4) if device == "cpu" else 0)
             # 실제로 한 번 돌려봐야 GPU 라이브러리 문제를 알 수 있다
             segs, _ = model.transcribe(np.zeros(16000, dtype=np.float32), language="ko",
                                        beam_size=5, vad_filter=False)
@@ -267,8 +310,8 @@ def load_model(model_name: str, device_pref: str):
             return model
         except Exception as e:  # noqa: BLE001 - 다음 방법으로 넘어간다
             last_error = e
-            if device == "cuda":
-                print(f"  (GPU 사용 불가: {str(e).splitlines()[0][:120]})")
+            if device == "cuda" and compute_type == "float16":
+                print(f"  (GPU 사용 불가: {(str(e).splitlines() or [''])[0][:120]})")
     raise RuntimeError(f"모델을 불러오지 못했습니다: {last_error}")
 
 
@@ -325,6 +368,7 @@ def transcribe_file(model, path: str, cfg: dict, hints: List[str], replacements)
             continue
         prev_text = seg.text.strip()
         words = [Word(w.start, w.end, w.word) for w in (seg.words or []) if w.word.strip()]
+        fix_first_word(words)
         if words:
             all_words.append(words)
 
@@ -382,8 +426,12 @@ def main() -> int:
         return 1
 
     add_nvidia_dll_paths()
-    print(f"모델 준비 중: {cfg['model']} (처음 한 번은 약 3GB를 내려받아요. 몇 분 걸릴 수 있어요)")
-    model = load_model(cfg["model"], cfg["device"].strip().lower())
+    print(f"모델 준비 중: {cfg['model']}")
+    try:
+        model = load_model(cfg["model"], cfg["device"].strip().lower())
+    except RuntimeError as e:
+        print(f"\n! {e}")
+        return 1
 
     if args.check:
         print("준비 완료!")
