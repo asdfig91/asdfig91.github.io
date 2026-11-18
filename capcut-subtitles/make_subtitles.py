@@ -114,17 +114,22 @@ def join_words(words: List[Word]) -> str:
 
 
 def fix_first_word(words: List[Word], max_gap: float = 0.6) -> None:
-    """Whisper는 구간의 첫 단어 시작을 앞쪽 무음에 잘못 찍는 경우가 있다.
-    (예: 실제로는 22.4초에 나오는 "한"을 19.6초로) 그러면 첫 단어만 앞 문장 끝에
-    따로 떠 버리므로, 둘째 단어와 너무 떨어져 있으면 둘째 단어 바로 앞으로 옮긴다."""
-    if len(words) < 2:
+    """Whisper는 구간 첫 단어의 시작을 앞쪽 무음에 잘못 찍는 경우가 많다.
+    1) 첫 단어가 둘째 단어와 멀리 떨어져 있으면 (예: 22.8초에 나오는 "한"을 19.6초로)
+       첫 단어만 앞 문장 끝에 따로 뜨므로, 둘째 단어 바로 앞으로 옮긴다.
+    2) 첫 단어가 앞 무음을 흡수해 길게 잡히면 (예: 두 글자 "랜덤"이 1.5초)
+       자막이 1초 넘게 일찍 뜨므로, 글자 수에 맞는 길이로 줄인다."""
+    if not words:
         return
-    first, second = words[0], words[1]
-    if second.start - first.end <= max_gap or SENTENCE_END.search(first.text.strip()):
-        return
-    duration = min(first.end - first.start, 0.15 + 0.12 * len(first.text.strip()))
-    first.end = second.start
-    first.start = max(first.end - duration, 0.0)
+    first = words[0]
+    letters = len(re.sub(r"\W", "", first.text))
+    max_duration = 0.25 + 0.15 * max(letters, 1)  # 보통 말 속도보다 넉넉하게
+    if len(words) > 1:
+        second = words[1]
+        if second.start - first.end > max_gap and not SENTENCE_END.search(first.text.strip()):
+            first.end = second.start
+    if first.end - first.start > max_duration:
+        first.start = first.end - max_duration
 
 
 def split_into_phrases(segments: List[List[Word]], max_gap: float = 0.6) -> List[List[Word]]:
