@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
     "remove_period": "yes",
     "device": "auto",
     "sync_fix": "yes",
+    "remove_words": "어, 어어, 음, 으음",
 }
 
 # Whisper가 조용한 구간에서 지어내는 경우가 많은 문장들 (유튜브 학습 데이터 영향)
@@ -135,6 +136,39 @@ def fix_first_word(words: List[Word], max_gap: float = 0.6) -> None:
             first.end = second.start
     if first.end - first.start > max_duration:
         first.start = first.end - max_duration
+
+
+def replace_in_words(words: List[Word], replacements) -> List[Word]:
+    """단어장의 '틀린말 -> 맞는말'을 단어 단위로 적용한다.
+    "제로 마이야"처럼 여러 단어에 걸친 표기는 한 단어로 합쳐서 바꾼다 (시간은 첫 단어 시작~마지막 단어 끝)."""
+    for wrong, right in replacements:
+        if not wrong:
+            continue
+        search_from = 0
+        while True:
+            starts, text = [], ""
+            for w in words:
+                starts.append(len(text))
+                text += w.text
+            pos = text.find(wrong, search_from)
+            if pos < 0:
+                break
+            end = pos + len(wrong)
+            a = max(i for i, st in enumerate(starts) if st <= pos)
+            b = max(i for i, st in enumerate(starts) if st < end)
+            merged_text = text[starts[a]:pos] + right + text[end:starts[b] + len(words[b].text)]
+            merged = Word(words[a].start, words[b].end, merged_text)
+            words = words[:a] + ([merged] if merged_text.strip() else []) + words[b + 1:]
+            search_from = starts[a] + len(merged_text)
+    return words
+
+
+def remove_filler_words(words: List[Word], fillers) -> List[Word]:
+    """'어', '음' 처럼 따로 떨어진 말버릇을 뺀다. '어?' '어!' 같은 감탄은 남긴다."""
+    if not fillers:
+        return words
+    return [w for w in words if w.text.strip().rstrip(".,…~") not in fillers
+            or w.text.strip()[-1:] in "?!"]
 
 
 def split_into_phrases(segments: List[List[Word]], max_gap: float = 0.6) -> List[List[Word]]:
@@ -406,6 +440,10 @@ def transcribe_file(model, path: str, cfg: dict, hints: List[str], replacements,
             lead = 0.1
         except Exception as e:  # noqa: BLE001 - 보정이 실패해도 자막은 만든다
             print(f"  (싱크 보정을 건너뜁니다: {e})")
+
+    fillers = {x.strip() for x in cfg.get("remove_words", "").split(",") if x.strip()}
+    all_words = [remove_filler_words(replace_in_words(ws, replacements), fillers) for ws in all_words]
+    all_words = [ws for ws in all_words if ws]
 
     elapsed = time.time() - started
     cues = build_cues(all_words, max_chars, max_seconds, replacements, remove_period, lead)
