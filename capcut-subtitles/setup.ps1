@@ -50,11 +50,21 @@ if (Test-Path $Uv) {
 }
 
 # 2) 파이썬 3.12 + 전용 가상환경
+#    폴더를 옮기면 가상환경이 예전 위치의 파이썬을 찾다가 깨지므로, 실제로 실행되는지 확인한다
+$pyOk = $false
 if (Test-Path $Py) {
+    & $Py -c "pass" 2>$null | Out-Null
+    $pyOk = ($LASTEXITCODE -eq 0)
+}
+if ($pyOk) {
     Write-Host '[2/4] 파이썬 준비됨'
 } else {
-    Write-Host '[2/4] 파이썬 3.12 설치 중...'
-    if (Test-Path $Venv) { Remove-Item -Recurse -Force $Venv }
+    if (Test-Path $Venv) {
+        Write-Host '[2/4] 폴더가 옮겨져서 파이썬 환경을 새로 만듭니다...'
+        Remove-Item -Recurse -Force $Venv
+    } else {
+        Write-Host '[2/4] 파이썬 3.12 설치 중...'
+    }
     & $Uv venv --python 3.12 $Venv
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Py)) { Fail '파이썬을 설치하지 못했습니다.' }
 }
