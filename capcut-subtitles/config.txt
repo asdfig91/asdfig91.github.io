@@ -21,3 +21,7 @@ model = large-v3
 
 # 실행 장치: auto = GPU 있으면 GPU, 없으면 CPU / cpu = 항상 CPU
 device = auto
+
+# 싱크 보정: 받아쓴 글자를 음성에 다시 맞춰서 자막 시간을 정확하게 (yes / no)
+#   처음 한 번 보정 모델(약 360MB)을 내려받고, 자막 만드는 시간이 조금 늘어나요
+sync_fix = yes

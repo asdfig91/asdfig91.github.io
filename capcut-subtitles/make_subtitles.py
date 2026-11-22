@@ -31,6 +31,7 @@ DEFAULT_CONFIG = {
     "max_seconds": "6",
     "remove_period": "yes",
     "device": "auto",
+    "sync_fix": "yes",
 }
 
 # Whisper가 조용한 구간에서 지어내는 경우가 많은 문장들 (유튜브 학습 데이터 영향)
@@ -50,6 +51,10 @@ HALLUCINATION_PHRASES = [
 # ---------------------------------------------------------------------------
 # 설정 / 단어장 읽기
 # ---------------------------------------------------------------------------
+
+def is_yes(value: str) -> bool:
+    return value.strip().lower() in ("yes", "y", "true", "1", "예", "네")
+
 
 def read_config(path: str = CONFIG_PATH) -> dict:
     cfg = dict(DEFAULT_CONFIG)
@@ -195,13 +200,19 @@ def apply_text_rules(text: str, replacements, remove_period: bool) -> str:
 
 
 def build_cues(segments: List[List[Word]], max_chars: int, max_seconds: float,
-               replacements=(), remove_period: bool = True) -> List[Cue]:
+               replacements=(), remove_period: bool = True, lead: float = 0.0) -> List[Cue]:
     cues: List[Cue] = []
     for phrase in split_into_phrases(segments):
         for chunk in balance_phrase(phrase, max_chars, max_seconds):
             text = apply_text_rules(join_words(chunk), replacements, remove_period)
             if text:
                 cues.append(Cue(chunk[0].start, chunk[-1].end, text))
+
+    # 자막은 늦게 뜨는 것보다 아주 살짝 먼저 뜨는 게 자연스럽다 (앞 자막의 말이 끝나기 전으로는 당기지 않음)
+    if lead > 0:
+        for k, cue in enumerate(cues):
+            floor = cues[k - 1].end if k > 0 else 0.0
+            cue.start = max(min(cue.start, max(cue.start - lead, floor)), 0.0)
 
     # 타이밍 다듬기: 말 끝난 뒤 조금 더 보여주고, 짧은 빈틈은 메워서 깜빡임 방지
     for k, cue in enumerate(cues):
@@ -330,24 +341,12 @@ def looks_like_hallucination(seg) -> bool:
     return False
 
 
-def transcribe_file(model, path: str, cfg: dict, hints: List[str], replacements) -> Optional[str]:
-    from faster_whisper import decode_audio
-
+def transcribe_words(model, audio, cfg: dict, hints: List[str]) -> List[List[Word]]:
+    """Whisper로 받아쓰고, Whisper 구간마다 단어 목록을 돌려준다."""
     language = cfg["language"].strip().lower()
     language = None if language in ("", "auto") else language
-    max_chars = int(cfg["max_chars"])
-    max_seconds = float(cfg["max_seconds"])
-    remove_period = cfg["remove_period"].strip().lower() in ("yes", "y", "true", "1", "예", "네")
-
-    print("  오디오를 읽는 중...")
-    with open(path, "rb") as f:  # 파일 객체로 넘기면 한글 경로도 안전
-        audio = decode_audio(f, sampling_rate=16000)
     duration = len(audio) / 16000
-    if duration < 0.1:
-        print("  ! 소리가 없는 파일입니다.")
-        return None
 
-    started = time.time()
     segments, info = model.transcribe(
         audio,
         language=language,
@@ -376,9 +375,40 @@ def transcribe_file(model, path: str, cfg: dict, hints: List[str], replacements)
         fix_first_word(words)
         if words:
             all_words.append(words)
+    return all_words
+
+
+def transcribe_file(model, path: str, cfg: dict, hints: List[str], replacements,
+                    aligner=None) -> Optional[str]:
+    from faster_whisper import decode_audio
+
+    max_chars = int(cfg["max_chars"])
+    max_seconds = float(cfg["max_seconds"])
+    remove_period = is_yes(cfg["remove_period"])
+
+    print("  오디오를 읽는 중...")
+    with open(path, "rb") as f:  # 파일 객체로 넘기면 한글 경로도 안전
+        audio = decode_audio(f, sampling_rate=16000)
+    duration = len(audio) / 16000
+    if duration < 0.1:
+        print("  ! 소리가 없는 파일입니다.")
+        return None
+
+    started = time.time()
+    all_words = transcribe_words(model, audio, cfg, hints)
+    lead = 0.0
+    if aligner is not None and all_words:
+        from aligner import align_all
+        print("  싱크 보정 중 (글자 단위로 음성에 다시 맞추기)...")
+        try:
+            fixed = align_all(aligner, audio, all_words)
+            print(f"  싱크 보정: {fixed}/{len(all_words)}개 구간을 정밀하게 맞췄어요")
+            lead = 0.1
+        except Exception as e:  # noqa: BLE001 - 보정이 실패해도 자막은 만든다
+            print(f"  (싱크 보정을 건너뜁니다: {e})")
 
     elapsed = time.time() - started
-    cues = build_cues(all_words, max_chars, max_seconds, replacements, remove_period)
+    cues = build_cues(all_words, max_chars, max_seconds, replacements, remove_period, lead)
     if not cues:
         print("  ! 인식된 말이 없습니다.")
         return None
@@ -438,6 +468,14 @@ def main() -> int:
         print(f"\n! {e}")
         return 1
 
+    aligner = None
+    if is_yes(cfg.get("sync_fix", "yes")):
+        try:
+            from aligner import Aligner, ensure_align_model
+            aligner = Aligner(ensure_align_model(MODELS_DIR))
+        except Exception as e:  # noqa: BLE001 - 보정 없이도 자막은 만들 수 있다
+            print(f"  (싱크 보정 모델을 준비하지 못해서 보정 없이 진행합니다: {(str(e).splitlines() or [''])[0][:150]})")
+
     if args.check:
         print("준비 완료!")
         return 0
@@ -449,7 +487,7 @@ def main() -> int:
     for i, path in enumerate(files, 1):
         print(f"\n[{i}/{len(files)}] {os.path.basename(path)}")
         try:
-            out = transcribe_file(model, path, cfg, hints, replacements)
+            out = transcribe_file(model, path, cfg, hints, replacements, aligner)
             if out:
                 print(f"  저장: {out}")
                 ok += 1
