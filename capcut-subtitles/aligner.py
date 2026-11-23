@@ -10,6 +10,7 @@ Whisper 자체의 단어 타이밍은 말이 빠르거나 배경음이 있으면
 
 import json
 import os
+import re
 from typing import List, Optional, Sequence
 
 import numpy as np
@@ -19,6 +20,51 @@ REVISION = "a6162331bac7e12c609ffe34c0a641b3efa6df62"  # 검증한 버전으로 
 FILES = ["vocab.json", "onnx/model_int8.onnx"]
 SAMPLE_RATE = 16000
 FRAME_SEC = 0.02  # 모델 출력 한 칸 = 20ms
+
+
+_SINO = "영일이삼사오육칠팔구"
+_NATIVE_ONES = ["", "한", "두", "세", "네", "다섯", "여섯", "일곱", "여덟", "아홉"]
+_NATIVE_TENS = ["", "열", "스물", "서른", "마흔", "쉰", "예순", "일흔", "여든", "아흔"]
+# 이 단위 앞의 1~99는 고유어로 읽는다 (두 시, 세 명, 한 번)
+_NATIVE_COUNTERS = ("시간", "시", "개", "명", "살", "번", "마리", "잔", "대", "권", "장", "달", "가지",
+                    "판", "병", "채", "벌", "그릇", "곳", "사람")
+
+
+def _sino_under_10000(n: int) -> str:
+    out = ""
+    for value, name in ((1000, "천"), (100, "백"), (10, "십")):
+        d, n = divmod(n, value)
+        if d:
+            out += ("" if d == 1 else _SINO[d]) + name
+    return out + (_SINO[n] if n else "")
+
+
+def _sino(n: int) -> str:
+    if n == 0:
+        return "영"
+    if n >= 10 ** 8:
+        return "".join(_SINO[int(c)] for c in str(n))
+    man, rest = divmod(n, 10000)
+    return (("" if man == 1 else _sino_under_10000(man)) + "만" if man else "") + _sino_under_10000(rest)
+
+
+def _native(n: int) -> str:
+    tens, ones = divmod(n, 10)
+    return ("스무" if tens == 2 and ones == 0 else _NATIVE_TENS[tens]) + _NATIVE_ONES[ones]
+
+
+def spoken_form(text: str) -> str:
+    """정렬용 읽기: 숫자를 한글로 바꾼다 (15분 → 십오분, 2시가 → 두시가).
+    정렬 모델은 한글만 알기 때문에, 숫자를 그대로 두면 그만큼 자막이 늦게 뜬다."""
+    text = re.sub(r"(?<=\d),(?=\d{3})", "", text)
+
+    def read(m):
+        n = int(m.group())
+        after = text[m.end():]
+        if 1 <= n <= 99 and after.startswith(_NATIVE_COUNTERS):
+            return _native(n)
+        return _sino(n)
+    return re.sub(r"\d+", read, text)
 
 
 def ensure_align_model(models_dir: str) -> str:
@@ -118,7 +164,7 @@ class Aligner:
         tokens: List[int] = []
         owner: List[int] = []  # 각 토큰이 몇 번째 단어의 글자인지
         for wi, w in enumerate(words):
-            chars = [self.vocab[c] for c in w.text.strip() if c in self.vocab and c != "|"]
+            chars = [self.vocab[c] for c in spoken_form(w.text.strip()) if c in self.vocab and c != "|"]
             if not chars:
                 continue
             if tokens and self.sep is not None:
@@ -186,11 +232,12 @@ class Aligner:
 
 
 def align_all(aligner: "Aligner", audio: np.ndarray, segments: List[list], pad: float = 0.5,
-              shift_failed: bool = True) -> int:
+              shift_failed: bool = False) -> int:
     """모든 Whisper 구간을 정렬한다. 앞뒤 구간과 겹치지 않는 범위에서 여유를 둔다. 고친 구간 수를 돌려준다.
 
-    정렬에 실패한 구간(배경음이 크거나 받아쓰기가 틀린 곳)은, 성공한 구간들이 옮겨진 만큼
-    (보통 Whisper가 일정하게 일찍 잡는 만큼) 같이 옮겨서 앞뒤 자막과 어긋나 보이지 않게 한다."""
+    정렬에 실패한 구간(배경음이 크거나 받아쓰기가 틀린 곳)은 Whisper 타이밍을 그대로 둔다.
+    shift_failed=True 이면 성공한 구간들이 옮겨진 만큼 같이 옮기지만, 실제 영상 확인에서
+    이렇게 옮긴 자막이 오히려 늦게 뜨는 경우가 많아서 기본으로는 끈다."""
     total = len(audio) / SAMPLE_RATE
     ok = [False] * len(segments)
     shifts = []
