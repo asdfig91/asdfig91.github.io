@@ -33,6 +33,7 @@ DEFAULT_CONFIG = {
     "device": "auto",
     "sync_fix": "yes",
     "remove_words": "어, 어어, 음, 으음",
+    "end_pad": "-0.1",
 }
 
 # Whisper가 조용한 구간에서 지어내는 경우가 많은 문장들 (유튜브 학습 데이터 영향)
@@ -256,7 +257,8 @@ def apply_text_rules(text: str, replacements, remove_period: bool) -> str:
 
 
 def build_cues(segments: List[List[Word]], max_chars: int, max_seconds: float,
-               replacements=(), remove_period: bool = True, lead: float = 0.0) -> List[Cue]:
+               replacements=(), remove_period: bool = True, lead: float = 0.0,
+               end_pad: float = 0.25, bridge_gap: float = 0.3, min_duration: float = 0.7) -> List[Cue]:
     cues: List[Cue] = []
     for phrase in split_into_phrases(segments):
         for chunk in balance_phrase(phrase, max_chars, max_seconds):
@@ -273,10 +275,10 @@ def build_cues(segments: List[List[Word]], max_chars: int, max_seconds: float,
     # 타이밍 다듬기: 말 끝난 뒤 조금 더 보여주고, 짧은 빈틈은 메워서 깜빡임 방지
     for k, cue in enumerate(cues):
         next_start = cues[k + 1].start if k + 1 < len(cues) else None
-        end = cue.end + 0.25
-        end = max(end, cue.start + 0.7)  # 최소 0.7초는 보이게
+        end = cue.end + end_pad
+        end = max(end, cue.start + min_duration)  # 너무 짧게 깜빡이지 않게
         if next_start is not None:
-            if next_start - end < 0.3:
+            if next_start - end < bridge_gap:
                 end = next_start
             end = min(end, next_start)
         cue.end = max(end, cue.start + 0.05)
@@ -452,14 +454,20 @@ def transcribe_file(model, path: str, cfg: dict, hints: List[str], replacements,
 
     started = time.time()
     all_words = transcribe_words(model, audio, cfg, hints)
-    lead = 0.0
+    timing = {}
     if aligner is not None and all_words:
         from aligner import align_all
         print("  싱크 보정 중 (글자 단위로 음성에 다시 맞추기)...")
         try:
             fixed = align_all(aligner, audio, all_words)
             print(f"  싱크 보정: {fixed}/{len(all_words)}개 구간을 정밀하게 맞췄어요")
-            lead = 0.1
+            # 보정된 시간은 정확하므로 여유를 거의 두지 않는다 (테스트: 끝 오차 평균 0.03~0.09초)
+            # 자막은 말보다 0.1초 먼저 뜨고, 보정 모델이 단어 끝을 살짝 늦게 잡는 만큼(0.1초) 일찍 내린다
+            try:
+                end_pad = float(cfg.get("end_pad", "-0.1"))
+            except ValueError:
+                end_pad = -0.1
+            timing = dict(lead=0.1, end_pad=end_pad, bridge_gap=0.1, min_duration=0.5)
         except Exception as e:  # noqa: BLE001 - 보정이 실패해도 자막은 만든다
             print(f"  (싱크 보정을 건너뜁니다: {e})")
 
@@ -468,7 +476,7 @@ def transcribe_file(model, path: str, cfg: dict, hints: List[str], replacements,
     all_words = [ws for ws in all_words if ws]
 
     elapsed = time.time() - started
-    cues = build_cues(all_words, max_chars, max_seconds, replacements, remove_period, lead)
+    cues = build_cues(all_words, max_chars, max_seconds, replacements, remove_period, **timing)
     if not cues:
         print("  ! 인식된 말이 없습니다.")
         return None

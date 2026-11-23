@@ -8,6 +8,7 @@ Whisper 자체의 단어 타이밍은 말이 빠르거나 배경음이 있으면
 모델: kresnik/wav2vec2-large-xlsr-korean (Apache-2.0) 의 ONNX 변환본
 """
 
+import copy
 import json
 import os
 import re
@@ -231,8 +232,22 @@ class Aligner:
         return True
 
 
+def voice_level(audio: np.ndarray, t0: float, t1: float) -> float:
+    """목소리 대역(300~3400Hz)의 평균 세기(dB). 녹음 크기와 상관없이 두 위치를 비교하는 데 쓴다."""
+    t1 = max(t1, t0 + 0.1)
+    levels = []
+    for t in np.arange(t0, t1, 0.05):
+        x = audio[int(t * SAMPLE_RATE):int((t + 0.1) * SAMPLE_RATE)]
+        if len(x) < 64:
+            continue
+        spec = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
+        freqs = np.fft.rfftfreq(len(x), 1 / SAMPLE_RATE)
+        levels.append(10 * np.log10(spec[(freqs > 300) & (freqs < 3400)].sum() + 1e-9))
+    return float(np.mean(levels)) if levels else -99.0
+
+
 def align_all(aligner: "Aligner", audio: np.ndarray, segments: List[list], pad: float = 0.5,
-              shift_failed: bool = False) -> int:
+              shift_failed: bool = False, max_search: float = 6.0, wide_min_score: float = -15.0) -> int:
     """모든 Whisper 구간을 정렬한다. 앞뒤 구간과 겹치지 않는 범위에서 여유를 둔다. 고친 구간 수를 돌려준다.
 
     정렬에 실패한 구간(배경음이 크거나 받아쓰기가 틀린 곳)은 Whisper 타이밍을 그대로 둔다.
@@ -252,6 +267,29 @@ def align_all(aligner: "Aligner", audio: np.ndarray, segments: List[list], pad: 
         if aligner.align_segment(audio, words, win_start, win_end):
             ok[i] = True
             shifts.append(words[0].start - before)
+
+    # 2차: 실패한 구간은 Whisper가 시간을 몇 초씩 잘못 찍은 경우가 많다 (예: 짧은 말을 조용한 곳에).
+    # 앞뒤 구간 사이의 빈 곳 전체(Whisper 위치에서 최대 max_search 초)에서 그 말을 다시 찾는다.
+    for i, words in enumerate(segments):
+        if ok[i] or not words:
+            continue
+        lo = segments[i - 1][-1].end if i > 0 and segments[i - 1] else 0.0
+        hi = segments[i + 1][0].start if i + 1 < len(segments) and segments[i + 1] else total
+        lo = max(lo, words[0].start - max_search, 0.0)
+        hi = min(hi, words[-1].end + max_search, total)
+        if hi - lo <= (words[-1].end - words[0].start) + 2 * pad + 0.2:
+            continue  # 1차와 거의 같은 범위라 다시 찾을 필요가 없다
+        trial = [copy.copy(w) for w in words]
+        # 배경음에 묻힌 짧은 말은 점수가 낮게 나오므로 기준을 낮추는 대신,
+        # 옮긴 자리에 실제로 목소리가 있는지(원래 자리보다 확실히 작지 않은지) 확인한다.
+        if not aligner.align_segment(audio, trial, lo, hi, min_score=wide_min_score):
+            continue
+        before = voice_level(audio, words[0].start, words[-1].end)
+        after = voice_level(audio, trial[0].start, trial[-1].end)
+        if after >= before - 6.0:
+            for w, t in zip(words, trial):
+                w.start, w.end = t.start, t.end
+            ok[i] = True
 
     if shift_failed and len(shifts) >= 3:
         shift = float(np.median(shifts))
