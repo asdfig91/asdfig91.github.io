@@ -453,9 +453,11 @@ def transcribe_file(model, path: str, cfg: dict, hints: List[str], replacements,
     if duration < 0.1:
         print("  ! 소리가 없는 파일입니다.")
         return None
+    print(f"  오디오 길이: {format_time(duration)[:8]}")
 
     started = time.time()
     all_words = transcribe_words(model, audio, cfg, hints)
+    report_missing_speech(all_words, duration)
     timing = {}
     if aligner is not None and all_words:
         from aligner import align_all
@@ -487,6 +489,17 @@ def transcribe_file(model, path: str, cfg: dict, hints: List[str], replacements,
         f.write(to_srt(cues))
     print(f"  완료: 자막 {len(cues)}개, {elapsed:.0f}초 걸림")
     return out_path
+
+
+def report_missing_speech(segments: List[List[Word]], duration: float, min_gap: float = 120.0) -> None:
+    """목소리를 하나도 찾지 못한 긴 구간(기본 2분 이상)이 있으면 알려준다.
+    예: 목소리만 뽑은 트랙이 영상 중간에 끝나서, 그 뒤가 음악뿐이거나 조용한 경우."""
+    times = [(ws[0].start, ws[-1].end) for ws in segments if ws]
+    edges = [0.0] + [t for pair in times for t in pair] + [duration]
+    gaps = [(edges[k], edges[k + 1]) for k in range(0, len(edges) - 1, 2) if edges[k + 1] - edges[k] >= min_gap]
+    for a, b in gaps:
+        print(f"  ! {format_time(a)[:8]} ~ {format_time(b)[:8]} 사이에서는 목소리를 찾지 못했어요.")
+        print("    이 부분의 오디오에 목소리가 들어 있는지 확인해 주세요 (트랙이 끝났거나 음소거됐을 수 있어요).")
 
 
 def pick_files_with_dialog() -> List[str]:
