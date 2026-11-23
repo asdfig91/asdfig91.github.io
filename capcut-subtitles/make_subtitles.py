@@ -87,7 +87,9 @@ def read_words(path: str = WORDS_PATH):
                 wrong, right = wrong.strip(), right.strip()
                 if wrong:
                     replacements.append((wrong, right))
-                    if right and right not in hints:
+                    # 맞는말이 한 단어일 때만 인식 힌트로도 쓴다. "산행을 갔고" 같은 구절을 힌트로 주면
+                    # Whisper가 다른 곳까지 다르게 받아써서, 맞던 자막이 바뀔 수 있다.
+                    if right and " " not in right and right not in hints:
                         hints.append(right)
             elif line not in hints:
                 hints.append(line)

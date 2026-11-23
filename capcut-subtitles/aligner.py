@@ -227,13 +227,21 @@ class Aligner:
             if last[1] < original_last_end <= last[1] + 1.0:
                 last[1] = original_last_end
 
+        # 구간 마지막 단어는 뒤따르는 글자가 없어서, 끝이 뒤쪽 배경음까지 늘어나기 쉽다.
+        # 글자 수에 비해 너무 길면 자른다 (자막이 말보다 오래 남는 것을 막는다).
+        if new_times[-1] is not None:
+            last = new_times[-1]
+            letters = len(re.sub(r"\W", "", spoken_form(words[-1].text)))
+            last[1] = min(last[1], last[0] + 0.3 + 0.2 * max(letters, 1))
+
         for w, (st, en) in zip(words, new_times):
             w.start, w.end = st, max(en, st + 0.02)
         return True
 
 
-def voice_level(audio: np.ndarray, t0: float, t1: float) -> float:
-    """목소리 대역(300~3400Hz)의 평균 세기(dB). 녹음 크기와 상관없이 두 위치를 비교하는 데 쓴다."""
+def voice_level(audio: np.ndarray, t0: float, t1: float, peak: bool = False) -> float:
+    """목소리 대역(300~3400Hz)의 세기(dB). 평균, 또는 peak=True 이면 가장 큰 값.
+    녹음 크기와 상관없이 두 위치를 비교하는 데 쓴다."""
     t1 = max(t1, t0 + 0.1)
     levels = []
     for t in np.arange(t0, t1, 0.05):
@@ -243,7 +251,9 @@ def voice_level(audio: np.ndarray, t0: float, t1: float) -> float:
         spec = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
         freqs = np.fft.rfftfreq(len(x), 1 / SAMPLE_RATE)
         levels.append(10 * np.log10(spec[(freqs > 300) & (freqs < 3400)].sum() + 1e-9))
-    return float(np.mean(levels)) if levels else -99.0
+    if not levels:
+        return -99.0
+    return float(np.max(levels) if peak else np.mean(levels))
 
 
 def align_all(aligner: "Aligner", audio: np.ndarray, segments: List[list], pad: float = 0.5,
@@ -284,12 +294,26 @@ def align_all(aligner: "Aligner", audio: np.ndarray, segments: List[list], pad: 
         # 옮긴 자리에 실제로 목소리가 있는지(원래 자리보다 확실히 작지 않은지) 확인한다.
         if not aligner.align_segment(audio, trial, lo, hi, min_score=wide_min_score):
             continue
-        before = voice_level(audio, words[0].start, words[-1].end)
-        after = voice_level(audio, trial[0].start, trial[-1].end)
-        if after >= before - 6.0:
+        # 말이 시작하는 부분(처음 0.4초)에 목소리가 있는지, 그 안의 가장 큰 소리로 비교한다.
+        # 평균을 쓰면 짧은 말 뒤의 무음이나 늘어난 끝 단어 때문에 맞는 위치를 놓친다.
+        before = voice_level(audio, words[0].start, words[0].start + 0.4, peak=True)
+        after = voice_level(audio, trial[0].start, trial[0].start + 0.4, peak=True)
+        if after < before - 6.0:
+            continue  # 옮긴 자리가 원래 자리보다 확실히 조용하면 믿지 않는다
+        orig_span = words[-1].end - words[0].start
+        trial_span = trial[-1].end - trial[0].start
+        if trial_span <= orig_span * 1.5 + 0.8:
             for w, t in zip(words, trial):
                 w.start, w.end = t.start, t.end
-            ok[i] = True
+        else:
+            # 넓은 범위에서는 뒤쪽 단어가 엉뚱하게 멀리 붙을 수 있다 (예: "노크 소리"의 "소리"가 5초 뒤로).
+            # 이럴 때는 첫 단어 위치만 믿고, 구간 전체를 Whisper의 단어 간격 그대로 옮긴다.
+            shift = trial[0].start - words[0].start
+            shift = min(shift, hi - words[-1].end) if shift > 0 else max(shift, lo - words[0].start)
+            for w in words:
+                w.start += shift
+                w.end += shift
+        ok[i] = True
 
     if shift_failed and len(shifts) >= 3:
         shift = float(np.median(shifts))
