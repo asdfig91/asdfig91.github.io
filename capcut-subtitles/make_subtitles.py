@@ -112,7 +112,15 @@ class Cue:
 
 
 SENTENCE_END = re.compile(r"[.?!…。？！]$")
-SOFT_BREAK = re.compile(r"[,，、]$")
+# Whisper가 마침표를 빠뜨려도 알아볼 수 있는 한국어 문장 끝맺음 (예: 갑시다, 있네요, 했다)
+KOREAN_SENTENCE_END = re.compile(r"(니다|시다|세요|어요|아요|해요|에요|예요|네요|군요|죠|구나|었다|았다|했다|겠다)$")
+# 줄을 나누기 좋은 자리: 쉼표, 그리고 말이 이어지는 연결 어미 (예: 있고, 갔는데, 했으니까)
+SOFT_BREAK = re.compile(r"([,，、]|[가-힣]고|는데|니까|면서|지만|어서|아서|해서)$")
+
+
+def ends_sentence(text: str) -> bool:
+    text = text.strip()
+    return bool(SENTENCE_END.search(text) or KOREAN_SENTENCE_END.search(text.rstrip(",，、")))
 
 
 def join_words(words: List[Word]) -> str:
@@ -171,19 +179,33 @@ def remove_filler_words(words: List[Word], fillers) -> List[Word]:
             or w.text.strip()[-1:] in "?!"]
 
 
-def split_into_phrases(segments: List[List[Word]], max_gap: float = 0.6) -> List[List[Word]]:
+def split_into_phrases(segments: List[List[Word]], max_gap: float = 0.8) -> List[List[Word]]:
     """문장 끝, Whisper 구간 끝, 긴 쉼에서 반드시 끊는다."""
     phrases = []
     for seg_words in segments:
         cur: List[Word] = []
         for w in seg_words:
-            if cur and (w.start - cur[-1].end > max_gap or SENTENCE_END.search(cur[-1].text.strip())):
+            if cur and (w.start - cur[-1].end > max_gap or ends_sentence(cur[-1].text)):
                 phrases.append(cur)
                 cur = []
             cur.append(w)
         if cur:
             phrases.append(cur)
-    return phrases
+
+    # Whisper가 "일단." 처럼 짧은 단어 뒤에 마침표를 잘못 찍으면 한 단어짜리 자막이 생긴다.
+    # 한국어 문장 끝맺음이 아닌 짧은 단어 하나에 마침표만 있고 바로 말이 이어지면 다음 문장에 붙인다.
+    merged: List[List[Word]] = []
+    for k, phrase in enumerate(phrases):
+        text = phrase[0].text.strip()
+        nxt = phrases[k + 1] if k + 1 < len(phrases) else None
+        if (nxt is not None and len(phrase) == 1 and text.endswith(".") and not text.endswith("..")
+                and len(text.rstrip(".")) <= 4 and not KOREAN_SENTENCE_END.search(text.rstrip("."))
+                and nxt[0].start - phrase[0].end <= 0.5):
+            phrase[0].text = phrase[0].text.rstrip(".")
+            phrases[k + 1] = phrase + nxt
+            continue
+        merged.append(phrase)
+    return merged
 
 
 def balance_phrase(words: List[Word], max_chars: int, max_seconds: float) -> List[List[Word]]:
